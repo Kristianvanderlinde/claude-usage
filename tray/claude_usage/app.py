@@ -9,12 +9,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from PySide6.QtCore import QObject, QPointF, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QGuiApplication, QKeySequence, QPainter,
-                           QPainterPath, QPen, QPixmap, QShortcut)
-from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsDropShadowEffect, QHBoxLayout,
-                               QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget)
+from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QGuiApplication, QKeySequence, QPainter, QPen,
+                           QPixmap, QShortcut)
+from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QMenu,
+                               QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-from . import autostart, data, icons
+from . import autostart, credentials, data, icons
 
 TOKEN_INTERVAL = 60      # tokens tellen (lokaal); de usage-API volgt data.PlanTracker
 USAGE_PAGE = "https://claude.ai/settings/usage"
@@ -223,6 +223,7 @@ def row(*widgets, stretch_at: int | None = None) -> QHBoxLayout:
 class Panel(QWidget):
     refresh_requested = Signal()
     quit_requested = Signal()
+    login_requested = Signal()
 
     def __init__(self):
         super().__init__(None, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
@@ -237,6 +238,7 @@ class Panel(QWidget):
         self.frame.setGraphicsEffect(shadow)
         outer.addWidget(self.frame)
         self.content: QWidget | None = None
+        self.anchor: QRect | None = None
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_requested.emit)
         QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.quit_requested.emit)
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
@@ -253,6 +255,11 @@ class Panel(QWidget):
             lay = QVBoxLayout(self.frame)
             lay.setContentsMargins(0, 0, 0, 0)
         if self.content is not None:
+            # Direct uit de layout halen: met deleteLater alleen telt de oude inhoud nog mee
+            # in de hoogte en wordt het paneel te hoog.
+            self.frame.layout().removeWidget(self.content)
+            self.content.hide()
+            self.content.setParent(None)
             self.content.deleteLater()
         self.content = QWidget()
         self.content.setFixedWidth(320)
@@ -304,6 +311,12 @@ class Panel(QWidget):
                 card.box.addLayout(block)
             if plan.warning:
                 card.box.addWidget(self._warning(plan.warning, 11))
+        if plan.needs_login:
+            card.box.addWidget(self._login_button(t))
+            if state.login_message:
+                msg = label(state.login_message, 11, t["muted"])
+                msg.setWordWrap(True)
+                card.box.addWidget(msg)
         v.addWidget(card)
 
         # Tokens
@@ -361,8 +374,17 @@ class Panel(QWidget):
             foot.addWidget(b)
         v.addLayout(foot)
 
+        # Hoogte bij de vaste breedte uitrekenen: tekst met regelafbreking laat sizeHint() anders
+        # veel te hoog uitvallen, waardoor de elementen uit elkaar getrokken worden.
+        v.activate()
+        height = v.heightForWidth(320) if v.hasHeightForWidth() else v.sizeHint().height()
+        self.content.setFixedHeight(max(height, v.minimumSize().height()))
         self.frame.layout().addWidget(self.content)
-        self.adjustSize()
+        self.frame.layout().activate()
+        self.layout().activate()
+        self.setFixedSize(self.sizeHint())
+        if self.isVisible():
+            self._place()
 
     @staticmethod
     def _toggle_autostart(check: CheckToggle, on: bool):
@@ -371,6 +393,18 @@ class Panel(QWidget):
         except OSError:
             QApplication.beep()
         check.setChecked(autostart.is_enabled())
+
+    def _login_button(self, t: dict[str, str]) -> QPushButton:
+        btn = QPushButton("Inloggen met Claude Code")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip("Opent een terminal met 'claude auth login'; daarna laadt het paneel vanzelf")
+        btn.setStyleSheet(
+            f"QPushButton {{ background: {css(icons.CLAUDE)}; color: white; border: none; border-radius: 7px;"
+            " padding: 7px 12px; font-size: 12px; font-weight: 600; }"
+            f"QPushButton:hover {{ background: {icons.CLAUDE.darker(110).name()}; }}"
+            f"QPushButton:pressed {{ background: {icons.CLAUDE.darker(125).name()}; }}")
+        btn.clicked.connect(self.login_requested.emit)
+        return btn
 
     @staticmethod
     def _section(text: str, t: dict[str, str]) -> QHBoxLayout:
@@ -390,9 +424,16 @@ class Panel(QWidget):
         return lab
 
     def show_near(self, anchor: QRect):
+        self.anchor = anchor
+        self._place()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _place(self):
         """Bij de taakbalk onderaan: boven het icoon; bij een balk bovenaan (Ubuntu): eronder."""
-        self.adjustSize()
-        size = self.sizeHint()
+        anchor = self.anchor or QRect(QCursor.pos(), QSize(1, 1))
+        size = self.size()
         screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
         avail = screen.availableGeometry()
         x = anchor.center().x() - size.width() // 2
@@ -403,9 +444,6 @@ class Panel(QWidget):
             y = max(anchor.bottom(), avail.top())
         y = max(avail.top(), min(y, avail.bottom() - size.height()))
         self.move(x, y)
-        self.show()
-        self.raise_()
-        self.activateWindow()
 
 
 # ---------------------------------------------------------------- toestand en besturing
@@ -414,6 +452,7 @@ class State:
     def __init__(self, tracker: data.PlanTracker | None = None):
         self.plan = tracker or data.PlanTracker()
         self.tokens: data.TokenStats | None = None
+        self.login_message: str | None = None
         self.last_update: datetime | None = None
         self.refreshing = False
 
@@ -432,14 +471,22 @@ class Controller(QObject):
         self.panel = Panel()
         self.panel.refresh_requested.connect(lambda: self.refresh(force=True))
         self.panel.quit_requested.connect(self.quit)
+        self.panel.login_requested.connect(self.login)
+        self.login_poll = QTimer(self, interval=5_000, timeout=self._check_login)
+        self.login_deadline = 0.0
+        self.known_token: str | None = None
 
         self.tray = QSystemTrayIcon(icons.tray_icon(None))
-        menu = QMenu()
-        menu.addAction("Paneel openen", self.toggle_panel)
-        menu.addAction("Nu verversen", lambda: self.refresh(force=True))
-        menu.addSeparator()
-        menu.addAction("Stop Claude Usage", self.quit)
-        self.tray.setContextMenu(menu)
+        if sys.platform == "win32":
+            # Windows: links klikken opent het paneel, rechts klikken dit menu.
+            # Op Linux bewust geen menu: de AppIndicator-balk toont dan bij elke klik het menu
+            # in plaats van het paneel te openen.
+            self.menu = QMenu()
+            self.menu.addAction("Paneel openen", self.toggle_panel)
+            self.menu.addAction("Nu verversen", lambda: self.refresh(force=True))
+            self.menu.addSeparator()
+            self.menu.addAction("Stop Claude Usage", self.quit)
+            self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self._activated)
         self.tray.setToolTip("Claude-gebruik")
         self.tray.show()
@@ -468,10 +515,51 @@ class Controller(QObject):
         if force or self.state.plan.due():
             self.state.plan.started()
             self.pending += 1
-            self.pool.submit(lambda: self.plan_done.emit(data.fetch_plan()))
+            self.pool.submit(self._fetch_plan_safely)
         self.pending += 1
-        self.pool.submit(lambda: self.tokens_done.emit(data.scan_tokens()))
+        self.pool.submit(self._scan_tokens_safely)
         self._rerender_if_visible()
+
+    # Draaien op een achtergrondthread. Altijd een signaal terugsturen, ook bij een onverwachte
+    # fout; anders blijft het paneel op "Laden…" staan.
+    def _fetch_plan_safely(self):
+        try:
+            result = data.fetch_plan()
+        except Exception as e:  # noqa: BLE001
+            result = data.PlanResult(error=f"Ophalen mislukt: {e}")
+        self.plan_done.emit(result)
+
+    def _scan_tokens_safely(self):
+        try:
+            stats = data.scan_tokens()
+        except Exception:  # noqa: BLE001
+            stats = data.TokenStats()
+        self.tokens_done.emit(stats)
+
+    # -- inloggen
+
+    def login(self):
+        error = credentials.start_login()
+        if error:
+            self.state.login_message = error
+        else:
+            self.state.login_message = "Log in via de terminal die nu openstaat. Het paneel laadt daarna vanzelf."
+            self.known_token = data.read_credentials()[0]
+            self.login_deadline = time.monotonic() + 10 * 60
+            self.login_poll.start()
+        self._rerender_if_visible()
+
+    def _check_login(self):
+        """Na het inloggen: zodra er een nieuwe login is, direct de limieten ophalen."""
+        token = data.read_credentials()[0]
+        if token and token != self.known_token:
+            self.login_poll.stop()
+            self.state.login_message = None
+            self.refresh(force=True)
+        elif time.monotonic() > self.login_deadline:
+            self.login_poll.stop()
+            self.state.login_message = "Geen nieuwe login gezien. Probeer het nog eens."
+            self._rerender_if_visible()
 
     def _on_plan(self, result: data.PlanResult):
         self.state.plan.apply(result)
@@ -505,7 +593,11 @@ class Controller(QObject):
             self.panel.render(self.state)
 
     def _activated(self, reason):
-        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+        opens = {QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick,
+                 QSystemTrayIcon.ActivationReason.MiddleClick}
+        if sys.platform != "win32":
+            opens.add(QSystemTrayIcon.ActivationReason.Context)   # geen menu op Linux: rechts klikken opent ook
+        if reason in opens:
             self.toggle_panel()
 
     def toggle_panel(self):

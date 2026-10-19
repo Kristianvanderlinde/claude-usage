@@ -19,10 +19,13 @@ De kleur geeft het niveau aan: terracotta is normaal, oranje vanaf 75% en rood v
   die login om je planlimieten op te vragen. Er is niets extra in te stellen.
   - macOS: de login staat in de Keychain. De eerste keer kan macOS om toestemming vragen. Kies dan
     **Altijd toestaan**.
-  - Windows en Ubuntu: de login staat in `~/.claude/.credentials.json`.
+  - Windows en Ubuntu: de app zoekt de login op alle plekken waar Claude Code of de Claude-app hem
+    bewaart: `.credentials.json` in de Claude-configmappen, Windows Credential Manager en de
+    sleutelbos van Ubuntu. Staan er meerdere logins, dan kiest hij de geldige die het langst geldig is.
+- Geen login gevonden, of is hij verlopen? Klik dan in het paneel op **Inloggen met Claude Code**.
+  Er opent een terminal met `claude auth login`. Zodra je bent ingelogd, laadt het paneel vanzelf.
+  Op macOS open je Claude Code één keer, dan ververst Claude Code de login zelf.
 - Log je in Claude Code in met een API-key, dan zijn er geen planlimieten. De tokens werken wel.
-- Staat er *Login verlopen*, open dan Claude Code één keer. Claude Code ververst de login dan zelf.
-  Deze app ververst de login bewust niet.
 
 ## Installeren
 
@@ -58,7 +61,6 @@ Download het bestand voor je systeem bij de [laatste release](../../releases/lat
 3. Klik op het icoon rechtsboven en vink **Start bij inloggen** aan.
 
 Zie je geen icoon? Zet dan de extensie *Ubuntu AppIndicators* aan via *Extensies*.
-Opent een klik eerst een menu, kies daar dan **Paneel openen**.
 
 ## Hoe het werkt
 

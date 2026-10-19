@@ -1,9 +1,9 @@
 """Gegevens ophalen: planlimieten via de Claude Code-login en tokens uit de lokale logs.
 
 Bronnen:
-  - Planlimieten: GET https://api.anthropic.com/api/oauth/usage met het OAuth-token dat
-    Claude Code op Windows en Linux bewaart in ~/.claude/.credentials.json. Het token wordt
-    alleen gelezen, nooit ververst; dat blijft Claude Code zelf doen.
+  - Planlimieten: GET https://api.anthropic.com/api/oauth/usage met het OAuth-token van
+    Claude Code (zie credentials.py voor waar dat gezocht wordt). Het token wordt alleen
+    gelezen, nooit ververst; dat blijft Claude Code zelf doen.
   - Tokens: de transcripts in ~/.claude/projects/**/*.jsonl.
 """
 
@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from . import credentials
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
@@ -36,6 +39,7 @@ class PlanResult:
     error: str | None = None
     subscription: str | None = None
     rate_limited: bool = False
+    needs_login: bool = False     # geen login gevonden, of verlopen (401)
     raw: dict | None = None
 
 
@@ -67,7 +71,7 @@ class TokenStats:
 # ---------------------------------------------------------------- paden
 
 def config_dirs() -> list[Path]:
-    """Mogelijke Claude-configmappen, de eerste die bestaat wint voor de login."""
+    """Mogelijke Claude-configmappen (voor de transcripts in projects/)."""
     home = Path.home()
     dirs = []
     if os.environ.get("CLAUDE_CONFIG_DIR"):
@@ -76,26 +80,31 @@ def config_dirs() -> list[Path]:
     return dirs
 
 
-def credentials_path() -> Path | None:
-    for d in config_dirs():
-        p = d / ".credentials.json"
-        if p.is_file():
-            return p
-    return None
-
-
 # ---------------------------------------------------------------- planlimieten
 
 def read_credentials(path: Path | None = None) -> tuple[str | None, str | None]:
-    """Geeft (accessToken, subscriptionType) terug, of (None, None)."""
-    path = path or credentials_path()
-    if not path:
-        return None, None
+    """Geeft (accessToken, subscriptionType) terug, of (None, None).
+    Zonder pad worden alle bekende opslagplekken doorzocht."""
+    if path is not None:
+        try:
+            cred = credentials.parse_blob(path.read_bytes(), str(path))
+        except OSError:
+            cred = None
+    else:
+        cred = credentials.find_credential()
+    return (cred.token, cred.subscription) if cred else (None, None)
+
+
+def ssl_context() -> ssl.SSLContext:
+    """Systeemcertificaten, aangevuld met certifi: een gebundelde app vindt die van het
+    systeem niet altijd."""
+    ctx = ssl.create_default_context()
     try:
-        oauth = json.loads(path.read_text(encoding="utf-8")).get("claudeAiOauth") or {}
-    except (OSError, ValueError):
-        return None, None
-    return oauth.get("accessToken"), oauth.get("subscriptionType")
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except (ImportError, OSError, ssl.SSLError):
+        pass
+    return ctx
 
 
 def parse_date(value) -> datetime | None:
@@ -142,24 +151,25 @@ def parse_usage(data: dict) -> list[LimitInfo]:
     return out
 
 
-def fetch_plan(credentials: Path | None = None, url: str = USAGE_URL) -> PlanResult:
-    token, subscription = read_credentials(credentials)
+def fetch_plan(creds_path: Path | None = None, url: str = USAGE_URL) -> PlanResult:
+    token, subscription = read_credentials(creds_path)
     if not token:
-        return PlanResult(error="Geen Claude Code-login gevonden")
+        return PlanResult(error="Geen Claude-login gevonden op deze computer", needs_login=True)
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-usage-tray",
     })
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 429:
             return PlanResult(error="Te veel verzoeken (429)", subscription=subscription, rate_limited=True)
-        messages = {401: "Login verlopen — open Claude Code om te verversen"}
-        return PlanResult(error=messages.get(e.code, f"Onverwachte status {e.code}"),
-                          subscription=subscription)
+        if e.code == 401:
+            return PlanResult(error="Login verlopen. Open Claude Code of log opnieuw in.",
+                              subscription=subscription, needs_login=True)
+        return PlanResult(error=f"Onverwachte status {e.code}", subscription=subscription)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         reason = getattr(e, "reason", e)
         return PlanResult(error=f"Netwerkfout: {reason}", subscription=subscription)
@@ -196,6 +206,7 @@ class PlanTracker:
         self.subscription: str | None = None
         self.error: str | None = None                # alleen als er geen cijfers zijn
         self.warning: str | None = None              # probleem terwijl oude cijfers blijven staan
+        self.needs_login = False
         self.next_fetch = datetime.min.replace(tzinfo=timezone.utc)
         self.strikes = 0
         self._raw: dict | None = None
@@ -212,6 +223,7 @@ class PlanTracker:
         now = now or _now()
         if result.subscription:
             self.subscription = result.subscription
+        self.needs_login = result.needs_login
         if result.rate_limited:
             self.next_fetch = now + self.BACKOFF[min(self.strikes, len(self.BACKOFF) - 1)]
             self.strikes += 1

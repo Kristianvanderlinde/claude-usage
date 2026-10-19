@@ -15,7 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from claude_usage import autostart, data  # noqa: E402
+from claude_usage import autostart, credentials, data  # noqa: E402
 
 NEW_STYLE = {
     "five_hour": {"utilization": 22.0, "resets_at": "2026-10-19T11:39:59.766103+00:00"},
@@ -86,7 +86,120 @@ class CredentialTests(unittest.TestCase):
     def test_config_dir_env(self):
         (Path(self.tmp.name) / ".credentials.json").write_text("{}")
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": self.tmp.name}):
-            self.assertEqual(data.credentials_path(), self.path)
+            self.assertIn(self.path, credentials.credential_files())
+
+
+def blob(token="t", exp_ms=None, sub="pro", **extra):
+    oauth = {"accessToken": token, "subscriptionType": sub}
+    if exp_ms is not None:
+        oauth["expiresAt"] = exp_ms
+    return json.dumps({"claudeAiOauth": oauth, **extra})
+
+
+def ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+class CredentialSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.future = datetime.now(timezone.utc) + timedelta(hours=5)
+        self.past = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_parse_blob_encodings(self):
+        text = blob("abc", ms(self.future))
+        for raw in (text.encode("utf-8"), text.encode("utf-16-le"), text.encode("utf-8").hex(),
+                    (text + "\x00").encode("utf-16-le")):
+            cred = credentials.parse_blob(raw, "x")
+            self.assertIsNotNone(cred, raw[:20])
+            self.assertEqual((cred.token, cred.subscription), ("abc", "pro"))
+            self.assertFalse(cred.expired)
+
+    def test_parse_blob_without_login(self):
+        for raw in (b"", b"{kapot", json.dumps({"mcpOAuth": {}}).encode(), json.dumps([1]).encode(),
+                    json.dumps({"claudeAiOauth": {"accessToken": 5}}).encode(), b"\xff\xfe\x00"):
+            self.assertIsNone(credentials.parse_blob(raw, "x"), raw)
+
+    def test_best_prefers_valid_then_longest(self):
+        c = credentials.Credential
+        expired = c("oud", None, self.past, "a")
+        short = c("kort", None, self.future - timedelta(hours=4), "b")
+        long = c("lang", None, self.future, "c")
+        no_exp = c("onbekend", None, None, "d")
+        self.assertEqual(credentials.best([expired, short, long]).token, "lang")
+        self.assertEqual(credentials.best([expired, no_exp]).token, "onbekend")
+        self.assertEqual(credentials.best([expired]).token, "oud")
+        self.assertIsNone(credentials.best([]))
+
+    def test_find_combines_all_sources(self):
+        home = self.root / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / ".credentials.json").write_text(blob("bestand", ms(self.future - timedelta(hours=3))))
+        app = self.root / "app"
+        nested = app / "claude-code" / "werkmap-1"
+        nested.mkdir(parents=True)
+        (nested / ".credentials.json").write_text(blob("app", ms(self.future - timedelta(hours=2))))
+        (app / "Cache").mkdir()
+        (app / "Cache" / ".credentials.json").write_text(blob("cache", ms(self.future + timedelta(days=9))))
+        win = [("Claude Code-credentials", blob("wincred", ms(self.future)).encode("utf-16-le")),
+               ("Claude Code-credentials-1a2b3c4d", json.dumps({"mcpOAuth": {}}).encode())]
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(Path, "home", return_value=home), \
+                mock.patch.object(credentials, "app_dirs", return_value=[app]), \
+                mock.patch.object(credentials, "windows_entries", return_value=win), \
+                mock.patch.object(credentials, "secret_service_entries", return_value=[]):
+            files = credentials.credential_files()
+            self.assertEqual(sorted(f.parent.name for f in files), [".claude", "werkmap-1"])   # Cache overgeslagen
+            self.assertEqual(credentials.find_credential().token, "wincred")
+            with mock.patch.object(credentials, "windows_entries", return_value=[]):
+                self.assertEqual(credentials.find_credential().token, "app")
+                self.assertEqual(data.read_credentials(), ("app", "pro"))
+
+    def test_service_names_with_config_dir(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(credentials.service_names(), ["Claude Code-credentials"])
+        with mock.patch.dict(os.environ, {**env, "CLAUDE_CONFIG_DIR": "/x/y"}, clear=True):
+            names = credentials.service_names()
+        self.assertEqual(len(names), 2)
+        self.assertRegex(names[1], r"^Claude Code-credentials-[0-9a-f]{8}$")
+
+
+class LoginTests(unittest.TestCase):
+    def test_claude_missing(self):
+        with mock.patch.object(credentials, "claude_executable", return_value=None):
+            self.assertIn("niet gevonden", credentials.start_login())
+
+    def test_linux_terminal(self):
+        which = {"gnome-terminal": "/usr/bin/gnome-terminal"}
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(credentials, "claude_executable", return_value="/home/u/.local/bin/claude"), \
+                mock.patch.object(credentials.shutil, "which", side_effect=which.get), \
+                mock.patch.object(credentials.subprocess, "Popen") as popen:
+            self.assertIsNone(credentials.start_login())
+        args = popen.call_args[0][0]
+        self.assertEqual(args[:4], ["/usr/bin/gnome-terminal", "--", "bash", "-lc"])
+        self.assertIn('"/home/u/.local/bin/claude" auth login', args[4])
+
+    def test_linux_no_terminal(self):
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(credentials, "claude_executable", return_value="/usr/bin/claude"), \
+                mock.patch.object(credentials.shutil, "which", return_value=None):
+            self.assertIn("/usr/bin/claude auth login", credentials.start_login())
+
+    def test_windows_command(self):
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.object(credentials, "claude_executable", return_value="C:\\Users\\u\\claude.exe"), \
+                mock.patch.object(credentials.subprocess, "Popen") as popen:
+            self.assertIsNone(credentials.start_login())
+        cmd = popen.call_args[0][0]
+        self.assertTrue(cmd.startswith('cmd.exe /c start "Claude inloggen" cmd.exe /k'))
+        self.assertIn('"C:\\Users\\u\\claude.exe" auth login', cmd)
 
 
 class FakeApi(BaseHTTPRequestHandler):
@@ -146,8 +259,15 @@ class FetchTests(unittest.TestCase):
 
     def test_no_login(self):
         self.creds.unlink()
-        with mock.patch.object(data, "credentials_path", return_value=None):
-            self.assertEqual(data.fetch_plan(None, self.url).error, "Geen Claude Code-login gevonden")
+        with mock.patch.object(credentials, "find_credential", return_value=None):
+            r = data.fetch_plan(None, self.url)
+        self.assertEqual(r.error, "Geen Claude-login gevonden op deze computer")
+        self.assertTrue(r.needs_login)
+
+    def test_needs_login_only_for_login_problems(self):
+        for status, needs in ((401, True), (429, False), (500, False)):
+            FakeApi.status = status
+            self.assertEqual(data.fetch_plan(self.creds, self.url).needs_login, needs)
 
     def test_network_down(self):
         r = data.fetch_plan(self.creds, "http://127.0.0.1:9/usage")
@@ -191,6 +311,13 @@ class TrackerTests(unittest.TestCase):
         tr.apply(data.PlanResult(error="Netwerkfout: x"), self.t0 + timedelta(minutes=30))
         self.assertEqual(tr.warning, "Netwerkfout: x")
         self.assertEqual(tr.fetched_at, self.t0)
+
+    def test_needs_login_follows_result(self):
+        tr = data.PlanTracker(self.path)
+        tr.apply(data.PlanResult(error="Geen login", needs_login=True), self.t0)
+        self.assertTrue(tr.needs_login)
+        tr.apply(self.ok, self.t0)
+        self.assertFalse(tr.needs_login)
 
     def test_started_prevents_double_fetch(self):
         tr = data.PlanTracker(self.path)
