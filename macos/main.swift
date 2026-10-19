@@ -32,6 +32,13 @@ struct TokenStats {
     var todayByModel: [String: TokenTotals] = [:]
 }
 
+/// Uitkomst van één keer ophalen bij de usage-API.
+enum FetchResult {
+    case ok([LimitInfo], Data)
+    case rateLimited
+    case failed(String)
+}
+
 enum PlanState {
     case loading
     case ok([LimitInfo])
@@ -62,9 +69,9 @@ enum PlanFetcher {
         return token
     }
 
-    static func fetch(completion: @escaping (PlanState) -> Void) {
+    static func fetch(completion: @escaping (FetchResult) -> Void) {
         guard let token = readAccessToken() else {
-            completion(.error("Geen Claude Code-login gevonden in de Keychain"))
+            completion(.failed("Geen Claude Code-login gevonden in de Keychain"))
             return
         }
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
@@ -72,19 +79,19 @@ enum PlanFetcher {
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.timeoutInterval = 20
         URLSession.shared.dataTask(with: req) { data, resp, err in
-            if let err = err { completion(.error("Netwerkfout: \(err.localizedDescription)")); return }
+            if let err = err { completion(.failed("Netwerkfout: \(err.localizedDescription)")); return }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             switch code {
             case 200: break
-            case 401: completion(.error("Login verlopen — open Claude Code om te verversen")); return
-            case 429: completion(.error("Even te vaak opgevraagd (429), probeer later")); return
-            default: completion(.error("Onverwachte status \(code)")); return
+            case 401: completion(.failed("Login verlopen — open Claude Code om te verversen")); return
+            case 429: completion(.rateLimited); return
+            default: completion(.failed("Onverwachte status \(code)")); return
             }
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(.error("Antwoord niet te lezen")); return
+                completion(.failed("Antwoord niet te lezen")); return
             }
-            completion(.ok(parse(json)))
+            completion(.ok(parse(json), data))
         }.resume()
     }
 
@@ -296,31 +303,23 @@ final class UsageModel: ObservableObject {
         launchAtLogin = LoginItem.isEnabled
     }
 
-    private var lastPlanFetch: Date?
-    private var pending = 0
-    let planInterval: TimeInterval = 180   // usage-API niet vaker dan elke 3 min
+    @Published var planFetchedAt: Date?
 
+    private var pending = 0
+    private(set) var nextPlanFetch = Date.distantPast
+    private(set) var rateLimitStrikes = 0
+    private let store = UserDefaults.standard
+
+    static let planInterval: TimeInterval = 600              // usage-API elke 10 min
+    static let backoff: [TimeInterval] = [900, 1800, 3600]   // na een 429: 15, 30, 60 min
+
+    init() { restore() }
+
+    /// Tokens worden altijd opnieuw geteld; de usage-API alleen als het tijd is,
+    /// of bij `force` (de verversknop).
     func refresh(force: Bool) {
-        let needPlan = force || lastPlanFetch.map { Date().timeIntervalSince($0) >= planInterval } ?? true
         refreshing = true
-        if needPlan {
-            lastPlanFetch = Date()
-            pending += 1
-            PlanFetcher.fetch { [weak self] state in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    // Bij een tijdelijke fout de laatste goede waarden laten staan.
-                    if case .error(let msg) = state, case .ok = self.plan {
-                        self.planWarning = msg
-                    } else {
-                        self.plan = state
-                        self.planWarning = nil
-                    }
-                    self.subscription = PlanFetcher.subscription
-                    self.done()
-                }
-            }
-        }
+        if force || Date() >= nextPlanFetch { fetchPlan() }
         pending += 1
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let stats = TokenScanner.scan()
@@ -329,6 +328,67 @@ final class UsageModel: ObservableObject {
                 self?.done()
             }
         }
+    }
+
+    private func fetchPlan() {
+        nextPlanFetch = Date().addingTimeInterval(Self.planInterval)   // geen dubbele aanvragen
+        pending += 1
+        PlanFetcher.fetch { [weak self] result in
+            DispatchQueue.main.async {
+                self?.apply(result)
+                self?.done()
+            }
+        }
+    }
+
+    func apply(_ result: FetchResult) {
+        subscription = PlanFetcher.subscription ?? subscription
+        switch result {
+        case .ok(let limits, let raw):
+            plan = .ok(limits)
+            planWarning = nil
+            planFetchedAt = Date()
+            rateLimitStrikes = 0
+            nextPlanFetch = Date().addingTimeInterval(Self.planInterval)
+            store.set(raw, forKey: "lastUsage")
+            store.set(planFetchedAt, forKey: "lastUsageAt")
+            store.set(subscription, forKey: "subscription")
+        case .rateLimited:
+            let wait = Self.backoff[min(rateLimitStrikes, Self.backoff.count - 1)]
+            rateLimitStrikes += 1
+            nextPlanFetch = Date().addingTimeInterval(wait)
+            showProblem(Self.blockedMessage(until: nextPlanFetch))
+        case .failed(let msg):
+            nextPlanFetch = Date().addingTimeInterval(Self.planInterval)
+            showProblem(msg)
+        }
+        store.set(nextPlanFetch, forKey: "nextPlanFetch")
+        store.set(rateLimitStrikes, forKey: "rateLimitStrikes")
+    }
+
+    static func blockedMessage(until: Date) -> String {
+        "Tijdelijk geblokkeerd (te veel verzoeken), opnieuw om \(Fmt.time(until))"
+    }
+
+    /// Zijn er al cijfers, dan blijven die staan en komt de melding eronder.
+    private func showProblem(_ msg: String) {
+        if case .ok = plan { planWarning = msg } else { plan = .error(msg) }
+    }
+
+    /// Laatste cijfers en wachttijd van een vorige keer terugzetten, zodat een herstart
+    /// niet meteen een nieuw verzoek doet.
+    private func restore() {
+        subscription = store.string(forKey: "subscription")
+        if let raw = store.data(forKey: "lastUsage"),
+           let json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] {
+            plan = .ok(PlanFetcher.parse(json))
+            planFetchedAt = store.object(forKey: "lastUsageAt") as? Date
+        }
+        rateLimitStrikes = store.integer(forKey: "rateLimitStrikes")
+        var next = store.object(forKey: "nextPlanFetch") as? Date ?? .distantPast
+        if let at = planFetchedAt { next = max(next, at.addingTimeInterval(Self.planInterval)) }
+        nextPlanFetch = next
+        if rateLimitStrikes > 0, next > Date() { showProblem(Self.blockedMessage(until: next)) }
     }
 
     private func done() {
@@ -450,7 +510,14 @@ struct UsagePanel: View {
     @ViewBuilder
     private func planSection(now: Date) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionTitle(text: "Planlimieten", icon: "gauge.with.dots.needle.33percent")
+            HStack(alignment: .firstTextBaseline) {
+                SectionTitle(text: "Planlimieten", icon: "gauge.with.dots.needle.33percent")
+                Spacer()
+                if let at = model.planFetchedAt {
+                    Text("stand van \(Fmt.resetTime(at))")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            }
             Card {
                 switch model.plan {
                 case .loading:
@@ -619,7 +686,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &bag)
 
         renderTitle()
-        model.refresh(force: true)
+        model.refresh(force: false)
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.model.refresh(force: false)
         }
@@ -679,7 +746,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePanel() {
         if panel.isVisible { hidePanel(); return }
-        if let last = model.lastUpdate, Date().timeIntervalSince(last) > 60 { model.refresh(force: false) }
         positionPanel()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)

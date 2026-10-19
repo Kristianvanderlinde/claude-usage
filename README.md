@@ -63,8 +63,12 @@ Opent een klik eerst een menu, kies daar dan **Paneel openen**.
 ## Hoe het werkt
 
 - **Planlimieten:** de app vraagt `GET https://api.anthropic.com/api/oauth/usage` op met het
-  OAuth-token van Claude Code, hooguit eens per 3 minuten. Dit endpoint is niet officieel
-  gedocumenteerd. Verandert het, dan toont de app een melding in plaats van cijfers.
+  OAuth-token van Claude Code, elke 10 minuten en als je op verversen klikt. Dit endpoint is
+  niet officieel gedocumenteerd. Verandert het, dan toont de app een melding in plaats van cijfers.
+- **Te veel verzoeken (429):** het endpoint is streng, en Claude Code vraagt het zelf ook op.
+  Na een 429 wacht de app steeds langer: 15, dan 30, dan 60 minuten. Zodra het weer lukt, gaat
+  hij terug naar elke 10 minuten. De laatste cijfers blijven staan, met "stand van" erbij, ook na
+  een herstart.
 - **Tokens:** de app telt de `usage`-velden in `~/.claude/projects/**/*.jsonl`. Dat gebeurt
   elke minuut, alleen met bestanden van deze week en volledig lokaal.
 - De app stuurt nergens anders gegevens heen.

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -34,6 +35,8 @@ class PlanResult:
     limits: list[LimitInfo] = field(default_factory=list)
     error: str | None = None
     subscription: str | None = None
+    rate_limited: bool = False
+    raw: dict | None = None
 
 
 @dataclass
@@ -152,8 +155,9 @@ def fetch_plan(credentials: Path | None = None, url: str = USAGE_URL) -> PlanRes
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        messages = {401: "Login verlopen — open Claude Code om te verversen",
-                    429: "Even te vaak opgevraagd (429), probeer later"}
+        if e.code == 429:
+            return PlanResult(error="Te veel verzoeken (429)", subscription=subscription, rate_limited=True)
+        messages = {401: "Login verlopen — open Claude Code om te verversen"}
         return PlanResult(error=messages.get(e.code, f"Onverwachte status {e.code}"),
                           subscription=subscription)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -161,7 +165,110 @@ def fetch_plan(credentials: Path | None = None, url: str = USAGE_URL) -> PlanRes
         return PlanResult(error=f"Netwerkfout: {reason}", subscription=subscription)
     except ValueError:
         return PlanResult(error="Antwoord niet te lezen", subscription=subscription)
-    return PlanResult(limits=parse_usage(data), subscription=subscription)
+    return PlanResult(limits=parse_usage(data), subscription=subscription, raw=data)
+
+
+# ---------------------------------------------------------------- ophaalschema en bewaren
+
+def state_path() -> Path:
+    """Waar de laatste cijfers en de wachttijd bewaard worden."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return base / "ClaudeUsage" / "state.json"
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "claude-usage" / "state.json"
+
+
+class PlanTracker:
+    """Bepaalt wanneer de usage-API gevraagd mag worden en onthoudt de laatste goede cijfers.
+
+    Elke 10 minuten; na een 429 oplopend 15, 30 en 60 minuten. Cijfers en wachttijd worden
+    bewaard, zodat een herstart niet meteen een nieuw verzoek doet.
+    """
+
+    INTERVAL = timedelta(minutes=10)
+    BACKOFF = (timedelta(minutes=15), timedelta(minutes=30), timedelta(minutes=60))
+
+    def __init__(self, path: Path | None = None):
+        self.path = path or state_path()
+        self.limits: list[LimitInfo] | None = None   # None: nog nooit cijfers gehad
+        self.fetched_at: datetime | None = None
+        self.subscription: str | None = None
+        self.error: str | None = None                # alleen als er geen cijfers zijn
+        self.warning: str | None = None              # probleem terwijl oude cijfers blijven staan
+        self.next_fetch = datetime.min.replace(tzinfo=timezone.utc)
+        self.strikes = 0
+        self._raw: dict | None = None
+        self._restore()
+
+    def due(self, now: datetime | None = None) -> bool:
+        return (now or _now()) >= self.next_fetch
+
+    def started(self, now: datetime | None = None) -> None:
+        """Bij het versturen: voorkomt dubbele aanvragen terwijl er een onderweg is."""
+        self.next_fetch = (now or _now()) + self.INTERVAL
+
+    def apply(self, result: PlanResult, now: datetime | None = None) -> None:
+        now = now or _now()
+        if result.subscription:
+            self.subscription = result.subscription
+        if result.rate_limited:
+            self.next_fetch = now + self.BACKOFF[min(self.strikes, len(self.BACKOFF) - 1)]
+            self.strikes += 1
+            self._problem(self.blocked_message())
+        elif result.error:
+            self.next_fetch = now + self.INTERVAL
+            self._problem(result.error)
+        else:
+            self.limits, self.fetched_at, self._raw = result.limits, now, result.raw
+            self.error = self.warning = None
+            self.strikes = 0
+            self.next_fetch = now + self.INTERVAL
+        self._save()
+
+    def blocked_message(self) -> str:
+        return f"Tijdelijk geblokkeerd (te veel verzoeken), opnieuw om {self.next_fetch.astimezone():%H:%M}"
+
+    def _problem(self, msg: str) -> None:
+        if self.limits is not None:
+            self.warning = msg
+        else:
+            self.error = msg
+
+    def _save(self) -> None:
+        state = {"raw": self._raw, "subscription": self.subscription, "strikes": self.strikes,
+                 "fetched_at": self.fetched_at.isoformat() if self.fetched_at else None,
+                 "next_fetch": self.next_fetch.isoformat()}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(state), encoding="utf-8")
+        except OSError:
+            pass   # bewaren is een gemak; zonder werkt de app gewoon
+
+    def _restore(self) -> None:
+        try:
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(state, dict):
+            return
+        self.subscription = state.get("subscription")
+        if isinstance(state.get("raw"), dict):
+            self._raw = state["raw"]
+            self.limits = parse_usage(self._raw)
+            self.fetched_at = parse_date(state.get("fetched_at"))
+        self.strikes = state.get("strikes") if isinstance(state.get("strikes"), int) else 0
+        nxt = parse_date(state.get("next_fetch"))
+        if nxt:
+            self.next_fetch = nxt
+        if self.fetched_at:
+            self.next_fetch = max(self.next_fetch, self.fetched_at + self.INTERVAL)
+        if self.strikes and self.next_fetch > _now():
+            self._problem(self.blocked_message())
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------- tokens
@@ -246,13 +353,19 @@ def fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def fmt_reset(d: datetime, now: datetime | None = None) -> str:
+def fmt_when(d: datetime, now: datetime | None = None) -> str:
+    """Vandaag alleen de tijd, anders ook dag en datum: "zo 25 okt 02:59"."""
     now = (now or datetime.now()).astimezone()
     local = d.astimezone()
     if local.date() == now.date():
-        when = local.strftime("%H:%M")
-    else:
-        when = f"{DAYS[local.weekday()]} {local.day} {MONTHS[local.month - 1]} {local.strftime('%H:%M')}"
+        return local.strftime("%H:%M")
+    return f"{DAYS[local.weekday()]} {local.day} {MONTHS[local.month - 1]} {local.strftime('%H:%M')}"
+
+
+def fmt_reset(d: datetime, now: datetime | None = None) -> str:
+    now = (now or datetime.now()).astimezone()
+    local = d.astimezone()
+    when = fmt_when(d, now)
     left = int((local - now).total_seconds())
     if left <= 0:
         rest = "nu"

@@ -127,6 +127,7 @@ class FetchTests(unittest.TestCase):
     def test_ok(self):
         r = data.fetch_plan(self.creds, self.url)
         self.assertIsNone(r.error)
+        self.assertEqual(r.raw, NEW_STYLE)
         self.assertEqual(r.subscription, "max")
         self.assertEqual(len(r.limits), 3)
         self.assertEqual(FakeApi.seen_auth, ("Bearer tok", "oauth-2025-04-20"))
@@ -137,6 +138,7 @@ class FetchTests(unittest.TestCase):
             r = data.fetch_plan(self.creds, self.url)
             self.assertIn(expected, r.error)
             self.assertEqual(r.limits, [])
+            self.assertEqual(r.rate_limited, status == 429)
 
     def test_bad_body(self):
         FakeApi.body = b"<html>"
@@ -150,6 +152,83 @@ class FetchTests(unittest.TestCase):
     def test_network_down(self):
         r = data.fetch_plan(self.creds, "http://127.0.0.1:9/usage")
         self.assertTrue(r.error.startswith("Netwerkfout"))
+
+
+class TrackerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "sub" / "state.json"
+        self.t0 = datetime(2026, 10, 19, 10, 0, tzinfo=timezone.utc)
+        self.ok = data.PlanResult(limits=data.parse_usage(NEW_STYLE), raw=NEW_STYLE, subscription="team")
+        self.blocked = data.PlanResult(error="Te veel verzoeken (429)", rate_limited=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_backoff_steps(self):
+        tr = data.PlanTracker(self.path)
+        self.assertTrue(tr.due(self.t0))
+        waits = []
+        for _ in range(4):
+            tr.apply(self.blocked, self.t0)
+            waits.append(int((tr.next_fetch - self.t0).total_seconds() // 60))
+        self.assertEqual(waits, [15, 30, 60, 60])
+        self.assertIsNone(tr.limits)
+        self.assertIn("Tijdelijk geblokkeerd", tr.error)
+        tr.apply(self.ok, self.t0)
+        self.assertEqual((tr.strikes, tr.error, tr.warning), (0, None, None))
+        self.assertEqual(tr.next_fetch - self.t0, timedelta(minutes=10))
+        self.assertFalse(tr.due(self.t0 + timedelta(minutes=9)))
+        self.assertTrue(tr.due(self.t0 + timedelta(minutes=10)))
+
+    def test_problem_keeps_old_numbers(self):
+        tr = data.PlanTracker(self.path)
+        tr.apply(self.ok, self.t0)
+        tr.apply(self.blocked, self.t0 + timedelta(minutes=10))
+        self.assertEqual(len(tr.limits), 3)
+        self.assertIsNone(tr.error)
+        self.assertIn("Tijdelijk geblokkeerd", tr.warning)
+        tr.apply(data.PlanResult(error="Netwerkfout: x"), self.t0 + timedelta(minutes=30))
+        self.assertEqual(tr.warning, "Netwerkfout: x")
+        self.assertEqual(tr.fetched_at, self.t0)
+
+    def test_started_prevents_double_fetch(self):
+        tr = data.PlanTracker(self.path)
+        tr.started(self.t0)
+        self.assertFalse(tr.due(self.t0 + timedelta(minutes=1)))
+
+    def test_restart_restores_numbers_and_waits(self):
+        now = datetime.now(timezone.utc)
+        tr = data.PlanTracker(self.path)
+        tr.apply(self.ok, now - timedelta(minutes=3))
+        again = data.PlanTracker(self.path)
+        self.assertEqual([l.percent for l in again.limits], [22, 4, 12])
+        self.assertEqual(again.subscription, "team")
+        self.assertEqual(again.fetched_at, now - timedelta(minutes=3))
+        self.assertFalse(again.due(now))                       # cijfers nog vers: niet meteen vragen
+        self.assertTrue(again.due(now + timedelta(minutes=7)))
+
+    def test_restart_during_block(self):
+        now = datetime.now(timezone.utc)
+        data.PlanTracker(self.path).apply(self.blocked, now)
+        again = data.PlanTracker(self.path)
+        self.assertEqual(again.strikes, 1)
+        self.assertFalse(again.due(now + timedelta(minutes=14)))
+        self.assertIn("Tijdelijk geblokkeerd", again.error)
+
+    def test_bad_or_unwritable_state(self):
+        self.path.parent.mkdir(parents=True)
+        for content in ("{kapot", "[1, 2]", json.dumps({"raw": "x", "strikes": "y", "next_fetch": 5})):
+            self.path.write_text(content)
+            tr = data.PlanTracker(self.path)
+            self.assertIsNone(tr.limits)
+            self.assertEqual(tr.strikes, 0)
+            self.assertTrue(tr.due())
+        blocker = Path(self.tmp.name) / "bestand"
+        blocker.write_text("geen map")
+        tr = data.PlanTracker(blocker / "state.json")   # map is eigenlijk een bestand
+        tr.apply(self.ok, self.t0)                       # bewaren mislukt stil
+        self.assertEqual(len(tr.limits), 3)
 
 
 def line(ts: datetime, msg_id: str, req: str, model: str = "claude-opus-5-5", out: int = 10, **extra) -> str:
@@ -211,6 +290,11 @@ class FormatTests(unittest.TestCase):
     def test_tokens(self):
         self.assertEqual([data.fmt_tokens(n) for n in (5, 1500, 2_500_000, 3_000_000_000)],
                          ["5", "2K", "2.5M", "3.0 mld"])
+
+    def test_when(self):
+        now = datetime(2026, 10, 5, 10, 0).astimezone()
+        self.assertEqual(data.fmt_when(now.replace(hour=8, minute=7), now), "08:07")
+        self.assertEqual(data.fmt_when(now - timedelta(days=1), now), "zo 4 okt 10:00")
 
     def test_reset(self):
         now = datetime(2026, 10, 5, 10, 0).astimezone()   # geen klokwissel in de week erna

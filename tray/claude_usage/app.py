@@ -16,8 +16,7 @@ from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsDropShadowEffect, 
 
 from . import autostart, data, icons
 
-PLAN_INTERVAL = 180      # usage-API niet vaker dan elke 3 min
-TOKEN_INTERVAL = 60
+TOKEN_INTERVAL = 60      # tokens tellen (lokaal); de usage-API volgt data.PlanTracker
 USAGE_PAGE = "https://claude.ai/settings/usage"
 
 
@@ -269,8 +268,8 @@ class Panel(QWidget):
         titles = QVBoxLayout()
         titles.setSpacing(1)
         titles.addWidget(label("Claude-gebruik", 15, t["text"], bold=True))
-        if state.subscription:
-            titles.addWidget(label(f"{state.subscription.capitalize()}-abonnement", 11, t["muted"]))
+        if state.plan.subscription:
+            titles.addWidget(label(f"{state.plan.subscription.capitalize()}-abonnement", 11, t["muted"]))
         head = QHBoxLayout()
         head.setSpacing(10)
         head.addWidget(logo)
@@ -279,17 +278,21 @@ class Panel(QWidget):
         v.addLayout(head)
 
         # Planlimieten
-        v.addLayout(self._section("PLANLIMIETEN", t))
+        plan = state.plan
+        section = self._section("PLANLIMIETEN", t)
+        if plan.fetched_at:
+            section.addWidget(label(f"stand van {data.fmt_when(plan.fetched_at)}", 11, t["muted"]))
+        v.addLayout(section)
         card = Card(t)
         card.box.setSpacing(14)
-        if state.plan is None:
+        if plan.limits is None and plan.error:
+            card.box.addWidget(self._warning(plan.error, 12))
+        elif plan.limits is None:
             card.box.addWidget(label("Laden…", 13, t["muted"]))
-        elif state.plan.error and not state.plan.limits:
-            card.box.addWidget(self._warning(state.plan.error, 12))
         else:
-            if not state.plan.limits:
+            if not plan.limits:
                 card.box.addWidget(label("Geen limieten gemeld", 13, t["muted"]))
-            for lim in state.plan.limits:
+            for lim in plan.limits:
                 block = QVBoxLayout()
                 block.setSpacing(6)
                 block.addLayout(row(label(lim.label, 13, t["text"], bold=True),
@@ -299,8 +302,8 @@ class Panel(QWidget):
                 if lim.resets_at:
                     block.addWidget(label(data.fmt_reset(lim.resets_at), 11, t["muted"]))
                 card.box.addLayout(block)
-            if state.warning:
-                card.box.addWidget(self._warning(state.warning, 11))
+            if plan.warning:
+                card.box.addWidget(self._warning(plan.warning, 11))
         v.addWidget(card)
 
         # Tokens
@@ -408,11 +411,9 @@ class Panel(QWidget):
 # ---------------------------------------------------------------- toestand en besturing
 
 class State:
-    def __init__(self):
-        self.plan: data.PlanResult | None = None
-        self.warning: str | None = None
+    def __init__(self, tracker: data.PlanTracker | None = None):
+        self.plan = tracker or data.PlanTracker()
         self.tokens: data.TokenStats | None = None
-        self.subscription: str | None = None
         self.last_update: datetime | None = None
         self.refreshing = False
 
@@ -427,7 +428,6 @@ class Controller(QObject):
         self.state = State()
         self.pool = ThreadPoolExecutor(max_workers=2)
         self.pending = 0
-        self.last_plan_fetch = 0.0
 
         self.panel = Panel()
         self.panel.refresh_requested.connect(lambda: self.refresh(force=True))
@@ -456,15 +456,17 @@ class Controller(QObject):
         if hasattr(hints, "colorSchemeChanged"):   # Qt 6.5+
             hints.colorSchemeChanged.connect(lambda _: self._rerender_if_visible())
 
-        self.refresh(force=True)
+        self._update_tray()
+        self.refresh(force=False)
 
     # -- gegevens
 
     def refresh(self, force: bool):
-        need_plan = force or time.monotonic() - self.last_plan_fetch >= PLAN_INTERVAL
+        """Tokens altijd opnieuw tellen; de usage-API alleen als het tijd is, of bij `force`
+        (de verversknop)."""
         self.state.refreshing = True
-        if need_plan:
-            self.last_plan_fetch = time.monotonic()
+        if force or self.state.plan.due():
+            self.state.plan.started()
             self.pending += 1
             self.pool.submit(lambda: self.plan_done.emit(data.fetch_plan()))
         self.pending += 1
@@ -472,15 +474,7 @@ class Controller(QObject):
         self._rerender_if_visible()
 
     def _on_plan(self, result: data.PlanResult):
-        if result.subscription:
-            self.state.subscription = result.subscription
-        prev = self.state.plan
-        # Bij een tijdelijke fout de laatste goede waarden laten staan.
-        if result.error and prev is not None and prev.limits:
-            self.state.warning = result.error
-        else:
-            self.state.plan = result
-            self.state.warning = None
+        self.state.plan.apply(result)
         self._done()
 
     def _on_tokens(self, stats: data.TokenStats):
@@ -498,9 +492,9 @@ class Controller(QObject):
 
     def _update_tray(self):
         plan = self.state.plan
-        if plan is None or not plan.limits:
+        if not plan.limits:
             self.tray.setIcon(icons.tray_icon(None))
-            self.tray.setToolTip("Claude-gebruik: " + (plan.error if plan and plan.error else "laden…"))
+            self.tray.setToolTip("Claude-gebruik: " + (plan.error or "laden…"))
             return
         parts = data.headline(plan.limits)
         self.tray.setIcon(icons.tray_icon(parts[0].percent))
@@ -519,8 +513,6 @@ class Controller(QObject):
         if self.panel.isVisible() or time.monotonic() - self.panel.closed_at < 0.3:
             self.panel.close()
             return
-        if self.state.last_update and (datetime.now() - self.state.last_update).total_seconds() > 60:
-            self.refresh(False)
         self.panel.render(self.state)
         geo = self.tray.geometry()
         anchor = geo if geo.isValid() and not geo.isEmpty() else QRect(QCursor.pos(), QSize(1, 1))
