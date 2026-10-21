@@ -6,6 +6,11 @@ Laat je Claude-gebruik altijd zien: in de menubalk van macOS en in de taakbalk v
   Dit zijn dezelfde cijfers als `/usage` in Claude Code.
 - **Claude Code-tokens:** hoeveel tokens je vandaag en deze week hebt gebruikt, ook per model.
 - **Start bij inloggen:** zet je aan of uit met een vinkje in het paneel.
+- **Meerdere accounts (macOS):** gebruik je Claude Code met meer dan één account, elk met een eigen
+  configmap (`CLAUDE_CONFIG_DIR`), dan krijgt elk account een tabblad bovenin het paneel.
+  De menubalk toont het laatst gekozen tabblad, met een gekleurde letter ervoor.
+  Naam en kleur kies je zelf. Zie
+  [Meerdere accounts](#meerdere-accounts).
 
 De kleur geeft het niveau aan: terracotta is normaal, oranje vanaf 75% en rood vanaf 90%.
 
@@ -61,6 +66,23 @@ Download het bestand voor je systeem bij de [laatste release](../../releases/lat
 3. Klik op het icoon rechtsboven en vink **Start bij inloggen** aan.
 
 Zie je geen icoon? Zet dan de extensie *Ubuntu AppIndicators* aan via *Extensies*.
+
+## Meerdere accounts
+
+Alleen in de macOS-versie. Claude Code bewaart per configmap een eigen login: `~/.claude` gebruikt
+het Keychain-item `Claude Code-credentials`, een andere map (via `CLAUDE_CONFIG_DIR`) krijgt
+`Claude Code-credentials-<eerste 8 tekens van sha256(pad)>`. De app volgt dezelfde regel.
+
+- **Vanzelf:** de app neemt `~/.claude` en elke map `~/.claude-*` waarvoor een login in de
+  Keychain staat. Bij een Team- of Enterprise-account is de naam de organisatie, anders
+  *Persoonlijk*.
+- **Zelf instellen:** klik in het paneel op het tandwiel (⌘,). Per account kies je daar een naam,
+  een kleur (klik op het vierkantje), de volgorde en of het account zichtbaar is. Met
+  **Map toevoegen…** voeg je een configmap toe die niet `~/.claude-*` heet.
+
+Wisselen doe je met de tabbladen of met ⌘1, ⌘2, … Elk account heeft zijn eigen limieten,
+tokens en wachttijd na een 429. De verversknop vraagt alleen het gekozen account direct op.
+Bij een nieuw account vraagt macOS één keer toegang tot het Keychain-item; kies **Altijd toestaan**.
 
 ## Hoe het werkt
 
